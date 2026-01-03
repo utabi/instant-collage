@@ -1,8 +1,10 @@
 # 10sec collage
 
-Web-based collage app with AI background removal.
+ネットで適当に画像検索→自動切り抜きしてコラージュをつくるだけのシンプルなアプリ
 
 ![Screenshot](screen.png)
+
+---
 
 ## Features
 
