@@ -22,6 +22,7 @@ interface CanvasItem {
   rotation: number
   scaleX: number
   scaleY: number
+  locked?: boolean
 }
 
 type Tab = 'search' | 'canvas'
@@ -69,6 +70,14 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [segmenting, setSegmenting] = useState(false)
 
+  // Area selection state
+  const [isSelectingArea, setIsSelectingArea] = useState(false)
+  const [selectionStart, setSelectionStart] = useState<{x: number, y: number} | null>(null)
+  const [selectionEnd, setSelectionEnd] = useState<{x: number, y: number} | null>(null)
+  const [selectedImageElement, setSelectedImageElement] = useState<HTMLImageElement | null>(null)
+  const [isDragging, setIsDragging] = useState(false)
+  const selectionCanvasRef = useRef<HTMLCanvasElement>(null)
+
   // Canvas state
   const [canvasItems, setCanvasItems] = useState<CanvasItem[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -90,6 +99,39 @@ function App() {
     window.addEventListener('resize', handleResize)
     return () => window.removeEventListener('resize', handleResize)
   }, [])
+
+  // 選択範囲を描画
+  useEffect(() => {
+    if (!isSelectingArea || !selectedImageElement || !selectionCanvasRef.current) return
+
+    const canvas = selectionCanvasRef.current
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    // キャンバスをクリアして画像を再描画
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+    ctx.drawImage(selectedImageElement, 0, 0, canvas.width, canvas.height)
+
+    // 選択範囲を描画
+    if (selectionStart && selectionEnd) {
+      const left = Math.min(selectionStart.x, selectionEnd.x)
+      const top = Math.min(selectionStart.y, selectionEnd.y)
+      const width = Math.abs(selectionEnd.x - selectionStart.x)
+      const height = Math.abs(selectionEnd.y - selectionStart.y)
+
+      // 選択範囲以外を暗くする
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.5)'
+      ctx.fillRect(0, 0, canvas.width, top) // 上
+      ctx.fillRect(0, top, left, height) // 左
+      ctx.fillRect(left + width, top, canvas.width - (left + width), height) // 右
+      ctx.fillRect(0, top + height, canvas.width, canvas.height - (top + height)) // 下
+
+      // 選択範囲の枠を描画
+      ctx.strokeStyle = '#00ff00'
+      ctx.lineWidth = 2
+      ctx.strokeRect(left, top, width, height)
+    }
+  }, [isSelectingArea, selectedImageElement, selectionStart, selectionEnd])
 
   // パレット外クリックで閉じる
   useEffect(() => {
@@ -208,20 +250,223 @@ function App() {
 
   const selectImage = (img: ImageResult) => {
     setSelectedImage(img)
+    // サムネイルをクリックしたら直接エリア選択モードに進む
+    setTimeout(() => {
+      startAreaSelectionForImage(img)
+    }, 0)
   }
 
-  const cutoutAndUseImage = async () => {
+  const startAreaSelectionForImage = (imageResult: ImageResult) => {
+    setIsSelectingArea(true)
+    setSelectionStart(null)
+    setSelectionEnd(null)
+
+    // 画像を読み込んでキャンバスに描画
+    const img = new window.Image()
+    img.crossOrigin = 'anonymous'
+    img.src = `${API_URL}/proxy-image?url=${encodeURIComponent(imageResult.url)}`
+    img.onload = () => {
+      setSelectedImageElement(img)
+
+      // キャンバスに画像を描画
+      const canvas = selectionCanvasRef.current
+      if (canvas) {
+        // 画面に収まるサイズに調整
+        const maxWidth = 800
+        const maxHeight = 600
+        let width = img.width
+        let height = img.height
+
+        if (width > maxWidth || height > maxHeight) {
+          const scale = Math.min(maxWidth / width, maxHeight / height)
+          width = width * scale
+          height = height * scale
+        }
+
+        canvas.width = width
+        canvas.height = height
+
+        const ctx = canvas.getContext('2d')
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height)
+        }
+      }
+    }
+  }
+
+  // エリア選択のマウスイベントハンドラー
+  const handleSelectionMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = selectionCanvasRef.current
+    if (!canvas) return
+
+    const rect = canvas.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+
+    // 新しい選択を開始
+    setIsDragging(true)
+    setSelectionStart({ x, y })
+    setSelectionEnd({ x, y })
+  }
+
+  const handleSelectionMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    // ドラッグ中のみ選択範囲を更新
+    if (!isDragging || !selectionStart) return
+
+    const canvas = selectionCanvasRef.current
+    if (!canvas) return
+
+    const rect = canvas.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+
+    setSelectionEnd({ x, y })
+  }
+
+  const handleSelectionMouseUp = () => {
+    // ドラッグ終了
+    setIsDragging(false)
+  }
+
+  // エリア選択を確定して切り抜き処理を実行
+  const confirmAreaSelection = async () => {
+    if (!selectionStart || !selectionEnd || !selectedImage) return
+
+    const canvas = selectionCanvasRef.current
+    if (!canvas) return
+
+    // 選択範囲を正規化（左上と右下を計算）
+    const left = Math.min(selectionStart.x, selectionEnd.x)
+    const top = Math.min(selectionStart.y, selectionEnd.y)
+    const width = Math.abs(selectionEnd.x - selectionStart.x)
+    const height = Math.abs(selectionEnd.y - selectionStart.y)
+
+    if (width < 10 || height < 10) {
+      alert('選択範囲が小さすぎます')
+      return
+    }
+
+    // キャンバスから選択範囲を切り抜き
+    const croppedCanvas = document.createElement('canvas')
+    croppedCanvas.width = width
+    croppedCanvas.height = height
+    const ctx = croppedCanvas.getContext('2d')
+    if (!ctx) return
+
+    // 元の画像を描画してから切り抜き
+    ctx.drawImage(canvas, left, top, width, height, 0, 0, width, height)
+
+    // エリア選択モードを終了（すぐに他の作業ができるように）
+    setIsSelectingArea(false)
+    setSelectionStart(null)
+    setSelectionEnd(null)
+    setSelectedImage(null)
+
+    // Blobに変換して背景除去処理へ（バックグラウンドで実行）
+    croppedCanvas.toBlob((blob) => {
+      if (blob) {
+        cutoutAndUseImage(blob)
+      }
+    }, 'image/png')
+  }
+
+  const cancelAreaSelection = () => {
+    setIsSelectingArea(false)
+    setSelectionStart(null)
+    setSelectionEnd(null)
+    setSelectedImage(null)
+  }
+
+  const useFullImage = async () => {
     if (!selectedImage) return
-    setSegmenting(true)
+
+    // エリア選択モードを終了
+    setIsSelectingArea(false)
+    setSelectionStart(null)
+    setSelectionEnd(null)
 
     try {
+      // 画像を直接取得（背景除去なし）
       const imgRes = await fetch(`${API_URL}/proxy-image?url=${encodeURIComponent(selectedImage.url)}`)
-
       if (!imgRes.ok) {
         throw new Error(`Proxy failed: ${imgRes.status}`)
       }
-
       const blob = await imgRes.blob()
+
+      // base64に変換
+      const reader = new FileReader()
+      reader.onloadend = () => {
+        const base64data = reader.result as string
+        const id = `item_${Date.now()}`
+
+        // サーバーに画像を保存
+        fetch(`${API_URL}/assets/save`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image_id: id, data: base64data })
+        })
+
+        const newItem: CanvasItem = {
+          id,
+          x: artboard.x + artboard.width / 2 - 100,
+          y: artboard.y + artboard.height / 2 - 100,
+          width: 200,
+          height: 200,
+          rotation: 0,
+          scaleX: 1,
+          scaleY: 1
+        }
+
+        // 画像をプリロード
+        const img = new window.Image()
+        img.src = base64data
+        img.onload = () => {
+          // アスペクト比を維持してサイズ調整
+          const maxSize = 200
+          const scale = Math.min(maxSize / img.width, maxSize / img.height)
+          newItem.width = img.width * scale
+          newItem.height = img.height * scale
+
+          setLoadedImages(prev => new Map(prev).set(id, img))
+          setCanvasItems(prev => [...prev, newItem])
+
+          // Canvasタブに切り替え
+          setActiveTab('canvas')
+          setSelectedId(id)
+
+          // トップにスクロール
+          window.scrollTo({ top: 0, behavior: 'smooth' })
+        }
+      }
+      reader.readAsDataURL(blob)
+    } catch (e) {
+      console.error('Failed to load image:', e)
+      alert('画像の読み込みに失敗しました')
+    }
+
+    setSelectedImage(null)
+  }
+
+  const cutoutAndUseImage = async (croppedBlob?: Blob) => {
+    if (!selectedImage && !croppedBlob) return
+    setSegmenting(true)
+
+    try {
+      let blob: Blob
+
+      if (croppedBlob) {
+        // エリア選択から渡された切り抜き画像を使用
+        blob = croppedBlob
+      } else {
+        // 通常の画像取得
+        const imgRes = await fetch(`${API_URL}/proxy-image?url=${encodeURIComponent(selectedImage!.url)}`)
+
+        if (!imgRes.ok) {
+          throw new Error(`Proxy failed: ${imgRes.status}`)
+        }
+
+        blob = await imgRes.blob()
+      }
       console.log('Blob size:', blob.size, 'type:', blob.type)
 
       if (blob.size === 0) {
@@ -299,6 +544,14 @@ function App() {
   // Transformer更新
   useEffect(() => {
     if (selectedId && transformerRef.current && stageRef.current) {
+      const selectedItem = canvasItems.find(item => item.id === selectedId)
+      // ロックされている場合はTransformerを表示しない
+      if (selectedItem?.locked) {
+        transformerRef.current.nodes([])
+        transformerRef.current.getLayer()?.batchDraw()
+        return
+      }
+
       // DOMの更新を待ってからノードを探す
       const updateTransformer = () => {
         if (!transformerRef.current || !stageRef.current) return
@@ -427,6 +680,17 @@ function App() {
     }
     setCanvasItems(prev => prev.filter(item => item.id !== selectedId))
     setSelectedId(null)
+  }
+
+  const toggleLock = () => {
+    if (!selectedId) return
+    setCanvasItems(prev =>
+      prev.map(item =>
+        item.id === selectedId
+          ? { ...item, locked: !item.locked }
+          : item
+      )
+    )
   }
 
   // アートボードをPNGとしてエクスポート
@@ -586,22 +850,28 @@ function App() {
             </section>
           )}
 
-          {selectedImage && (
-            <section className="preview-section">
-              <h2>選択した画像</h2>
-              <div className="preview-container">
-                <img
-                  src={`${API_URL}/proxy-image?url=${encodeURIComponent(selectedImage.url)}`}
-                  alt="Selected"
-                  className="preview-image"
+          {isSelectingArea && (
+            <section className="area-selection-section">
+              <h2>切り抜きエリアを選択</h2>
+              <p>マウスでドラッグしてエリアを選択してください</p>
+              <div className="area-selection-container">
+                <canvas
+                  ref={selectionCanvasRef}
+                  className="selection-canvas"
+                  onMouseDown={handleSelectionMouseDown}
+                  onMouseMove={handleSelectionMouseMove}
+                  onMouseUp={handleSelectionMouseUp}
+                  style={{ cursor: 'crosshair' }}
                 />
-                <button
-                  onClick={cutoutAndUseImage}
-                  disabled={segmenting}
-                  className="cutout-button"
-                >
-                  {segmenting ? '処理中...' : '使用'}
+              </div>
+              <div className="area-selection-buttons">
+                <button onClick={confirmAreaSelection} disabled={!selectionStart || !selectionEnd || segmenting}>
+                  {segmenting ? '処理中...' : '選択範囲を使用'}
                 </button>
+                <button onClick={useFullImage} disabled={segmenting}>
+                  全体を使用
+                </button>
+                <button onClick={cancelAreaSelection}>キャンセル</button>
               </div>
             </section>
           )}
@@ -634,61 +904,28 @@ function App() {
                   shadowOpacity={0.3}
                 />
 
-                {/* 2. 完全にアートボード外の画像のみ100%で表示 */}
+                {/* 2. アートボード外の画像（暗く表示） */}
                 {canvasItems.map(item => {
                   const img = loadedImages.get(item.id)
                   if (!img) return null
-
-                  // 回転を考慮したバウンディングボックスを計算
-                  const w = item.width * item.scaleX
-                  const h = item.height * item.scaleY
-                  const rad = item.rotation * Math.PI / 180
-                  const cos = Math.abs(Math.cos(rad))
-                  const sin = Math.abs(Math.sin(rad))
-                  // 回転後のバウンディングボックスサイズ
-                  const rotatedWidth = w * cos + h * sin
-                  const rotatedHeight = w * sin + h * cos
-                  // 中心点からバウンディングボックスを計算
-                  const centerX = item.x + w / 2
-                  const centerY = item.y + h / 2
-                  const bboxLeft = centerX - rotatedWidth / 2
-                  const bboxRight = centerX + rotatedWidth / 2
-                  const bboxTop = centerY - rotatedHeight / 2
-                  const bboxBottom = centerY + rotatedHeight / 2
-
-                  const artboardRight = artboard.x + artboard.width
-                  const artboardBottom = artboard.y + artboard.height
-                  const intersects = !(
-                    bboxRight < artboard.x ||
-                    bboxLeft > artboardRight ||
-                    bboxBottom < artboard.y ||
-                    bboxTop > artboardBottom
+                  return (
+                    <KonvaImage
+                      key={`outside-${item.id}`}
+                      image={img}
+                      x={item.x}
+                      y={item.y}
+                      width={item.width}
+                      height={item.height}
+                      rotation={item.rotation}
+                      scaleX={item.scaleX}
+                      scaleY={item.scaleY}
+                      opacity={0.1}
+                      listening={false}
+                    />
                   )
-
-                  // 完全にアートボード外なら100%不透明で表示
-                  if (!intersects) {
-                    return (
-                      <KonvaImage
-                        key={`outside-${item.id}`}
-                        image={img}
-                        x={item.x}
-                        y={item.y}
-                        width={item.width}
-                        height={item.height}
-                        rotation={item.rotation}
-                        scaleX={item.scaleX}
-                        scaleY={item.scaleY}
-                        opacity={1}
-                        listening={false}
-                      />
-                    )
-                  }
-
-                  // 交差している場合：はみ出し部分は表示しない（アートボード内のみクリップ表示）
-                  return null
                 })}
 
-                {/* 3. アートボード内にクリップされた画像（不透明） */}
+                {/* 3. アートボード内にクリップされた画像（100%表示） */}
                 <Group
                   clipX={artboard.x}
                   clipY={artboard.y}
@@ -710,6 +947,7 @@ function App() {
                         rotation={item.rotation}
                         scaleX={item.scaleX}
                         scaleY={item.scaleY}
+                        opacity={1}
                         listening={false}
                       />
                     )
@@ -733,22 +971,26 @@ function App() {
                       scaleX={item.scaleX}
                       scaleY={item.scaleY}
                       opacity={0}
-                      draggable
+                      draggable={!item.locked}
                       onDragEnd={(e) => {
-                        handleItemChange(item.id, {
-                          x: e.target.x(),
-                          y: e.target.y()
-                        })
+                        if (!item.locked) {
+                          handleItemChange(item.id, {
+                            x: e.target.x(),
+                            y: e.target.y()
+                          })
+                        }
                       }}
                       onTransformEnd={(e) => {
-                        const node = e.target
-                        handleItemChange(item.id, {
-                          x: node.x(),
-                          y: node.y(),
-                          rotation: node.rotation(),
-                          scaleX: node.scaleX(),
-                          scaleY: node.scaleY()
-                        })
+                        if (!item.locked) {
+                          const node = e.target
+                          handleItemChange(item.id, {
+                            x: node.x(),
+                            y: node.y(),
+                            rotation: node.rotation(),
+                            scaleX: node.scaleX(),
+                            scaleY: node.scaleY()
+                          })
+                        }
                       }}
                     />
                   )
@@ -858,6 +1100,14 @@ function App() {
               </button>
 
               <div className="toolbar-divider" />
+
+              <button
+                onClick={toggleLock}
+                title={canvasItems.find(item => item.id === selectedId)?.locked ? "ロック解除" : "ロック"}
+                disabled={!selectedId}
+              >
+                {canvasItems.find(item => item.id === selectedId)?.locked ? '🔒' : '🔓'}
+              </button>
 
               <button onClick={deleteSelected} className="delete-button" title="削除" disabled={!selectedId}>
                 ✕
